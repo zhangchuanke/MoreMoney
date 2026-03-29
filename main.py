@@ -4,6 +4,11 @@ MoreMoney - A股 AI 自动化交易 Agent
 """
 import asyncio
 import signal
+import sys, io
+# Force UTF-8 output on Windows to avoid GBK encode errors
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 from datetime import datetime
 
 from core.graph.trading_graph import compile_graph

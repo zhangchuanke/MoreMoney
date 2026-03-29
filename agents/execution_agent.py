@@ -3,6 +3,7 @@
 职责：将决策转化为实际订单，管理委托状态，处理成交回报
 """
 import asyncio
+import logging
 from datetime import datetime
 from typing import Dict, List
 
@@ -10,6 +11,9 @@ from core.state.agent_state import AgentState, TradeDecision
 from tools.broker.order_manager import OrderManager
 from tools.broker.position_manager import PositionManager
 from config.settings import settings
+from compliance.order_compliance import OrderComplianceChecker, ViolationType
+
+logger = logging.getLogger("agents.execution")
 
 
 class ExecutionAgent:
@@ -19,11 +23,13 @@ class ExecutionAgent:
     2. 支持：市价单 / 限价单 / 分批建仓
     3. 跟踪订单状态，处理部分成交
     4. 触发止损/止盈平仓
+    5. 所有订单在下单前经过报撤单合规硬约束检查
     """
 
     def __init__(self):
         self.order_mgr = OrderManager()
         self.position_mgr = PositionManager()
+        self.compliance = OrderComplianceChecker()
 
     async def execute(self, state: AgentState) -> AgentState:
         decisions: List[TradeDecision] = state.get("decisions", [])
@@ -32,9 +38,27 @@ class ExecutionAgent:
         pending: List[Dict] = state.get("pending_orders", [])
 
         # 1. 先处理止损/止盈触发
+        #    止损单豁免高频/撤单率检查，但仍须通过单笔占比检查
         sl_orders = await self._check_stop_triggers(state)
         for order in sl_orders:
+            sl_violations = self.compliance.check_order(order)
+            sl_blocks = [
+                v for v in sl_violations
+                if v.severity == "block"
+                and v.violation_type == ViolationType.SINGLE_ORDER_RATIO
+            ]
+            if sl_blocks:
+                reason = "; ".join(str(v) for v in sl_blocks)
+                logger.warning("[ExecutionAgent] 止损单被合规拦截(单笔占比): %s", reason)
+                rejected.append({
+                    **order,
+                    "reject_reason": "compliance_block_stop",
+                    "compliance_violations": [str(v) for v in sl_blocks],
+                })
+                continue
             result = await self._place_order(order)
+            if result["status"] == "filled":
+                self.compliance.record_order(order)
             (executed if result["status"] == "filled" else rejected).append(result)
 
         # 2. 执行新决策
@@ -42,24 +66,54 @@ class ExecutionAgent:
             if decision.get("action") == "hold":
                 continue
             order = self._decision_to_order(decision, state)
+
+            # 2a. 报撤单合规硬约束检查（强制拦截）
+            compliance_violations = self.compliance.check_order(order)
+            block_violations = [v for v in compliance_violations if v.severity == "block"]
+            if block_violations:
+                reason = "; ".join(str(v) for v in block_violations)
+                logger.warning("[ExecutionAgent] 订单被合规模块拦截: %s", reason)
+                rejected.append({
+                    **order,
+                    "reject_reason": "compliance_block",
+                    "compliance_violations": [str(v) for v in block_violations],
+                })
+                continue
+            # 警告级违规仅记录日志，不拦截
+            for v in compliance_violations:
+                if v.severity == "warn":
+                    logger.warning("[ExecutionAgent] 合规警告: %s", v)
+
+            # 2b. 资金/T+1 前置检查
             if not self._pre_check(order, state):
                 rejected.append({**order, "reject_reason": "pre_check_failed"})
                 continue
+
             result = await self._place_order(order)
-            (executed if result["status"] in ("filled", "partial") else rejected).append(result)
+            if result["status"] in ("filled", "partial"):
+                # 成功报单后向合规器登记
+                self.compliance.record_order(order)
+                executed.append(result)
+            else:
+                rejected.append(result)
 
         # 3. 更新持仓状态
         updated_portfolio = await self.position_mgr.refresh(state.get("portfolio", {}))
 
+        compliance_blocks = [
+            r for r in rejected
+            if r.get("reject_reason", "").startswith("compliance")
+        ]
         return {
             **state,
             "executed_orders": executed,
             "rejected_orders": rejected,
             "pending_orders": pending,
             "portfolio": updated_portfolio,
+            "compliance_daily_summary": self.compliance.daily_summary(),
             "logs": [
                 f"[ExecutionAgent] 执行完成：成交 {len(executed)} 笔，"
-                f"拒绝 {len(rejected)} 笔"
+                f"拒绝 {len(rejected)} 笔（合规拦截 {len(compliance_blocks)} 笔）"
             ],
         }
 
@@ -67,7 +121,6 @@ class ExecutionAgent:
     def _decision_to_order(self, decision: TradeDecision, state: AgentState) -> Dict:
         portfolio = state.get("portfolio", {})
         total_assets = portfolio.get("total_assets", 100000)
-        cash = portfolio.get("cash", 0)
         positions = portfolio.get("positions", {})
         symbol = decision["symbol"]
         action = decision["action"]

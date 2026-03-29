@@ -1,5 +1,11 @@
 """
 主编排 Agent - 负责市场扫描、信号聚合、最终决策
+
+重构要点：
+  - scan_market() 新增市场风格识别（MarketRegimeDetector），结果写入 state
+  - aggregate_signals() 废弃 operator.add 数值累加，改为 AdaptiveSignalAggregator
+    多维度投票制 + 场景优先权重（财报季/题材/极端行情一票否决）
+  - make_decision() 注入市场风格信息辅助 LLM 决策
 """
 import json
 from datetime import datetime
@@ -8,6 +14,8 @@ from typing import Dict, List
 from llm.qwen_client import QwenClient
 from llm.prompts.analysis_prompts import SIGNAL_AGGREGATION_PROMPT, DECISION_PROMPT
 from core.state.agent_state import AgentState, TradeDecision
+from core.market_regime import MarketRegimeDetector
+from core.signal_aggregator import AdaptiveSignalAggregator
 from tools.market_data.realtime_feed import RealtimeFeed
 from tools.market_data.index_data import IndexDataTool
 
@@ -15,12 +23,12 @@ from tools.market_data.index_data import IndexDataTool
 class OrchestratorAgent:
     """
     主编排 Agent：
-    1. scan_market()       - 扫描市场，筛选标的
-    2. aggregate_signals() - 汇总四维信号，加权评分
-    3. make_decision()     - 最终决策（综合 LLM 推理）
+      1. scan_market()       - 扫描市场，识别市场风格，筛选标的
+      2. aggregate_signals() - 自适应混合聚合四维信号（投票制 + 一票否决）
+      3. make_decision()     - 最终决策（综合 LLM 推理 + 市场风格上下文）
     """
 
-    # 默认四维权重（运行时由 _load_weights() 动态覆盖）
+    # 默认四维权重（实际运行时由市场风格 + 动态权重文件双重覆盖）
     DIMENSION_WEIGHTS: Dict[str, float] = {
         "technical":    0.30,
         "sentiment":    0.25,
@@ -29,83 +37,147 @@ class OrchestratorAgent:
     }
 
     def __init__(self):
-        self.llm        = QwenClient()
-        self.realtime   = RealtimeFeed()
-        self.index_tool = IndexDataTool()
+        self.llm          = QwenClient()
+        self.realtime     = RealtimeFeed()
+        self.index_tool   = IndexDataTool()
+        self.regime_detector = MarketRegimeDetector()
+        self.aggregator      = AdaptiveSignalAggregator()
 
     # ------------------------------------------------------------------
     async def scan_market(self, state: AgentState) -> AgentState:
-        """扫描大盘环境，更新 universe，筛选 target_symbols"""
+        """扫描大盘环境，识别市场风格，更新 universe，筛选 target_symbols"""
         market_overview = await self.index_tool.get_overview()
         sentiment  = self._classify_market_sentiment(market_overview)
         risk_level = self._classify_risk_level(market_overview)
+
+        # ── 新增：市场风格识别 ──────────────────────────────────────────
+        regime_result = self.regime_detector.detect(market_overview)
 
         candidates     = await self.realtime.get_hot_stocks(top_n=50)
         target_symbols = [s["symbol"] for s in candidates[:20]]
 
         return {
             **state,
-            "timestamp":       datetime.now().isoformat(),
-            "market_overview": market_overview,
+            "timestamp":        datetime.now().isoformat(),
+            "market_overview":  market_overview,
             "market_sentiment": sentiment,
-            "risk_level":      risk_level,
-            "target_symbols":  target_symbols,
-            "logs": [f"[Orchestrator] 市场扫描完成，筛选标的 {len(target_symbols)} 只"],
+            "risk_level":       risk_level,
+            "target_symbols":   target_symbols,
+            # 市场风格写入 state（供聚合器、决策节点使用）
+            "market_regime":    regime_result.regime,
+            "market_regime_detail": {
+                "regime":       regime_result.regime,
+                "confidence":   regime_result.confidence,
+                "veto_active":  regime_result.veto_active,
+                "description":  regime_result.description,
+                "base_weights": regime_result.base_weights,
+                "signals":      regime_result.signals,
+            },
+            "logs": [
+                f"[Orchestrator] 市场扫描完成，筛选标的 {len(target_symbols)} 只",
+                f"[Orchestrator] 市场风格: {regime_result.regime} "
+                f"(置信度={regime_result.confidence:.2f}) | {regime_result.description}",
+            ],
         }
 
     # ------------------------------------------------------------------
     async def aggregate_signals(self, state: AgentState) -> AgentState:
-        """加权聚合四维信号，生成每个标的的综合评分"""
+        """
+        自适应混合聚合四维信号。
+
+        核心变化（替代原始 operator.add 数值累加）：
+          - 使用 AdaptiveSignalAggregator 进行多维度投票制聚合
+          - 根据市场风格自动切换权重矩阵
+          - 财报季 / 题材炒作期触发场景优先权重
+          - 极端行情触发一票否决，直接输出 neutral/hold
+        """
         signals = state.get("signals", [])
-        weights = self._load_weights()   # 动态权重
 
-        scores:  Dict[str, float] = {}
-        details: Dict[str, List]  = {}
+        # 重建 MarketRegimeResult（从 state 读取，避免重复调用接口）
+        regime_detail = state.get("market_regime_detail", {})
+        from core.market_regime import MarketRegimeResult, REGIME_BASE_WEIGHTS, DEFAULT_WEIGHTS
+        regime_name = regime_detail.get("regime", "volatile")
+        regime = MarketRegimeResult(
+            regime=regime_name,
+            confidence=regime_detail.get("confidence", 0.5),
+            base_weights=regime_detail.get(
+                "base_weights",
+                REGIME_BASE_WEIGHTS.get(regime_name, DEFAULT_WEIGHTS),
+            ),
+            veto_active=regime_detail.get("veto_active", False),
+            signals=regime_detail.get("signals", {}),
+            description=regime_detail.get("description", ""),
+        )
 
-        direction_map = {"bullish": 1.0, "neutral": 0.0, "bearish": -1.0}
+        is_earnings = AdaptiveSignalAggregator.is_earnings_season()
 
-        for signal in signals:
-            symbol = signal.get("symbol", "market")
-            dim    = signal.get("dimension", "")
-            weight = weights.get(dim, 0.25)
-            d_score = direction_map.get(signal.get("direction", "neutral"), 0.0)
-            weighted = (
-                d_score
-                * signal.get("strength", 0.5)
-                * signal.get("confidence", 0.5)
-                * weight
+        # ── 按标的聚合 ────────────────────────────────────────────────
+        symbol_set = list(dict.fromkeys(
+            s.get("symbol", "market") for s in signals
+        ))
+
+        aggregated_scores: Dict[str, float] = {}
+        aggregated_details: Dict[str, Dict] = {}
+
+        for symbol in symbol_set:
+            agg = self.aggregator.aggregate(
+                symbol=symbol,
+                signals=signals,
+                regime=regime,
+                is_earnings_season=is_earnings,
             )
-            scores[symbol] = scores.get(symbol, 0.0) + weighted
-            details.setdefault(symbol, []).append(signal)
+            aggregated_scores[symbol]  = agg.final_score
+            aggregated_details[symbol] = {
+                "final_score":   agg.final_score,
+                "vote_result":   agg.vote_result,
+                "vote_breakdown": agg.vote_breakdown,
+                "vote_weights":  agg.vote_weights,
+                "veto_triggered": agg.veto_triggered,
+                "veto_reason":   agg.veto_reason,
+                "confidence":    agg.confidence,
+            }
 
-        # LLM 二次审核：对评分前 5 标的做综合分析
-        top_symbols      = sorted(scores, key=lambda s: scores[s], reverse=True)[:5]
+        # ── LLM 二次审核：对评分前 5 标的做综合分析 ───────────────────
+        top_symbols      = sorted(
+            aggregated_scores, key=lambda s: aggregated_scores[s], reverse=True
+        )[:5]
         analysis_reports = []
+
         for sym in top_symbols:
+            sym_signals = [s for s in signals if s.get("symbol") == sym]
             prompt = SIGNAL_AGGREGATION_PROMPT.format(
                 symbol=sym,
-                score=round(scores[sym], 4),
-                signals=json.dumps(details.get(sym, []), ensure_ascii=False, indent=2),
+                score=round(aggregated_scores[sym], 4),
+                signals=json.dumps(sym_signals, ensure_ascii=False, indent=2),
                 market_overview=json.dumps(
                     state.get("market_overview", {}), ensure_ascii=False
                 ),
             )
             report_text = await self.llm.chat(prompt)
-            analysis_reports.append(
-                {"symbol": sym, "score": scores[sym], "report": report_text}
-            )
+            analysis_reports.append({
+                "symbol":        sym,
+                "score":         aggregated_scores[sym],
+                "vote_detail":   aggregated_details.get(sym, {}),
+                "regime":        regime.regime,
+                "report":        report_text,
+            })
 
         return {
             **state,
             "analysis_reports": analysis_reports,
-            "logs": [f"[Orchestrator] 信号聚合完成，评分标的 {len(scores)} 只"],
+            "logs": [
+                f"[Orchestrator] 信号聚合完成，评分标的 {len(aggregated_scores)} 只",
+                f"[Orchestrator] 聚合模式: 自适应投票制 | 风格={regime.regime} "
+                f"| 财报季={is_earnings}",
+            ],
         }
 
     # ------------------------------------------------------------------
     async def make_decision(self, state: AgentState) -> AgentState:
-        """根据聚合报告 + 组合状态生成最终交易决策"""
+        """根据聚合报告 + 组合状态 + 市场风格生成最终交易决策"""
         memory        = state.get("memory", {})
         learned_rules = memory.get("learned_rules", [])
+        regime_detail = state.get("market_regime_detail", {})
 
         prompt = DECISION_PROMPT.format(
             reports=json.dumps(
@@ -126,6 +198,13 @@ class OrchestratorAgent:
                 decisions = []
         except Exception:
             decisions = []
+
+        # 极端行情一票否决：强制清空非风控指令的主动买入决策
+        if regime_detail.get("veto_active"):
+            decisions = [
+                d for d in decisions
+                if d.get("action") not in ("buy", "add")
+            ]
 
         return {
             **state,
@@ -157,7 +236,7 @@ class OrchestratorAgent:
         return "low"
 
     def _load_weights(self) -> Dict[str, float]:
-        """运行时动态加载权重（支持 self_evolution 热更新）"""
+        """保留兼容接口（已由 AdaptiveSignalAggregator 内部处理）"""
         try:
             from self_evolution.knowledge_updater import KnowledgeUpdater
             return KnowledgeUpdater().load_current_weights()

@@ -1,6 +1,6 @@
 """
-Agent全局状态定义 - LangGraph State Schema
-所有Agent节点共享的状态结构
+Agent 全局状态定义 - LangGraph State Schema
+所有 Agent 节点共享的状态结构
 """
 from typing import TypedDict, Annotated, List, Dict, Optional, Any
 from datetime import datetime
@@ -9,36 +9,36 @@ import operator
 
 class MarketSignal(TypedDict):
     """单个分析维度的信号"""
-    symbol: str             # 股票代码
-    dimension: str          # technical / sentiment / capital / fundamental
+    symbol: str
+    dimension: str          # technical / sentiment / capital_flow / fundamental
     direction: str          # bullish / bearish / neutral
     strength: float         # 0.0 ~ 1.0
     confidence: float       # 0.0 ~ 1.0
-    reasoning: str          # LLM推理过程
-    indicators: Dict        # 具体指标数值
+    reasoning: str
+    indicators: Dict
     timestamp: str
 
 
 class TradeDecision(TypedDict):
     """交易决策"""
     action: str             # buy / sell / hold / add / reduce
-    symbol: str             # 股票代码
-    target_position: float  # 目标仓位占比 0~1
-    current_position: float # 当前仓位占比
-    price_limit: Optional[float]  # 限价，None则市价
-    quantity: Optional[int]       # 数量，None则自动计算
-    stop_loss: float        # 止损价
-    take_profit: float      # 止盈价
+    symbol: str
+    target_position: float
+    current_position: float
+    price_limit: Optional[float]
+    quantity: Optional[int]
+    stop_loss: float
+    take_profit: float
     urgency: str            # immediate / normal / passive
-    reasoning: str          # 决策理由
-    risk_score: float       # 风险评分 0~1
+    reasoning: str
+    risk_score: float
 
 
 class PortfolioStatus(TypedDict):
     """组合状态"""
     total_assets: float
     cash: float
-    positions: Dict[str, Dict]   # symbol -> {qty, cost, current_price, pnl}
+    positions: Dict[str, Dict]
     daily_pnl: float
     total_pnl: float
     max_drawdown: float
@@ -47,19 +47,39 @@ class PortfolioStatus(TypedDict):
 
 
 class AgentMemory(TypedDict):
-    """Agent记忆结构"""
-    recent_decisions: List[Dict]       # 近期决策记录
-    successful_patterns: List[str]     # 成功模式
-    failed_patterns: List[str]         # 失败模式
-    market_regime: str                 # trending / ranging / volatile / crisis
-    learned_rules: List[str]           # 自我学习总结的规则
-    last_reflection: str               # 上次反思时间
+    """Agent 记忆结构"""
+    recent_decisions: List[Dict]
+    successful_patterns: List[str]
+    failed_patterns: List[str]
+    market_regime: str
+    learned_rules: List[str]
+    last_reflection: str
+
+
+class MarketRegimeDetail(TypedDict):
+    """
+    市场风格识别详情（由 MarketRegimeDetector 产出，写入 state）。
+    供 AdaptiveSignalAggregator、OrchestratorAgent.make_decision 直接读取。
+    """
+    regime: str          # bull / bear / volatile / theme / value
+    confidence: float    # 识别置信度 0~1
+    veto_active: bool    # 是否触发极端行情一票否决
+    description: str     # 人可读的风格描述
+    base_weights: Dict   # 对应的四维基准权重
+    signals: Dict        # 识别依据的原始指标快照
+
+
+class WeightBounds(TypedDict):
+    """权重边界配置（供审计 / UI 展示）"""
+    lower: float
+    upper: float
+    dimensions: List[str]
 
 
 class AgentState(TypedDict):
     """
-    LangGraph主状态 - 所有节点读写的统一状态
-    使用 Annotated[list, operator.add] 支持并行节点追加
+    LangGraph 主状态 —— 所有节点读写的统一状态。
+    使用 Annotated[list, operator.add] 支持并行节点追加。
     """
     # === 基础信息 ===
     session_id: str
@@ -68,10 +88,10 @@ class AgentState(TypedDict):
     trading_phase: str          # pre_market / morning / midday / afternoon / post_market
 
     # === 分析目标 ===
-    target_symbols: List[str]   # 当前分析的股票列表
-    universe: List[str]         # 全量股票池
+    target_symbols: List[str]
+    universe: List[str]
 
-    # === 并行分析结果（使用add合并各Agent输出）===
+    # === 并行分析结果（operator.add 合并各 Agent 输出）===
     signals: Annotated[List[MarketSignal], operator.add]
     analysis_reports: Annotated[List[Dict], operator.add]
     news_summaries: Annotated[List[Dict], operator.add]
@@ -83,16 +103,21 @@ class AgentState(TypedDict):
     rejected_orders: Annotated[List[Dict], operator.add]
 
     # === 市场环境 ===
-    market_overview: Dict       # 大盘状态
-    sector_rotation: Dict       # 板块轮动
+    market_overview: Dict
+    sector_rotation: Dict
     risk_level: str             # low / medium / high / extreme
     market_sentiment: str       # fear / neutral / greed
+
+    # === 市场风格 ===
+    market_regime: str                        # bull / bear / volatile / theme / value
+    market_regime_detail: MarketRegimeDetail  # 完整风格识别结果
+    weight_bounds: WeightBounds               # 当前权重边界（供审计使用）
 
     # === 组合状态 ===
     portfolio: PortfolioStatus
 
     # === 风控状态 ===
-    risk_flags: Annotated[List[str], operator.add]   # 风险预警
+    risk_flags: Annotated[List[str], operator.add]
     circuit_breaker_triggered: bool
     daily_loss_limit_reached: bool
 
@@ -102,9 +127,26 @@ class AgentState(TypedDict):
     strategy_update_needed: bool
 
     # === 系统消息 ===
-    messages: Annotated[List[Dict], operator.add]    # Agent间通信
+    messages: Annotated[List[Dict], operator.add]
     errors: Annotated[List[str], operator.add]
     logs: Annotated[List[str], operator.add]
+
+    # === 数据质量校验（data_quality 节点写入）===
+    data_quality_reports: List[Dict]
+    degraded_symbols: List[str]
+
+    # === 新闻过滤（news_filter 节点写入）===
+    filtered_news: Dict
+
+    # === 技能引擎（skills 节点写入）===
+    skill_results: List[Dict]    # 各 Skill 执行结果摘要
+    merged_weight_adj: Dict      # 合并后的四维权重调整量
+    merged_signal_adj: Dict      # 合并后的标的信号调整量
+    skill_veto_active: bool      # 技能引擎是否触发一票否决
+    skill_veto_reason: str       # 一票否决原因
+
+    # === 滑点适配（slippage 节点写入）===
+    slippage_report: List[Dict]
 
     # === 迭代控制 ===
     iteration_count: int

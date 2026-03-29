@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#121820"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#00e5a0"/>
+      <stop offset="100%" stop-color="#00c8ff"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- background circle -->
+  <circle cx="256" cy="256" r="248" fill="url(#bg)" stroke="#1e2d3d" stroke-width="4"/>
+
+  <!-- subtle grid -->
+  <g stroke="#1e2d3d" stroke-width="1" opacity="0.6">
+    <line x1="90" y1="180" x2="422" y2="180"/>
+    <line x1="90" y1="256" x2="422" y2="256"/>
+    <line x1="90" y1="332" x2="422" y2="332"/>
+    <line x1="170" y1="140" x2="170" y2="370"/>
+    <line x1="256" y1="140" x2="256" y2="370"/>
+    <line x1="342" y1="140" x2="342" y2="370"/>
+  </g>
+
+  <!-- uptrend chart line (glow) -->
+  <polyline points="90,320 155,290 200,310 255,230 300,250 355,175 420,140"
+    fill="none" stroke="url(#line)" stroke-width="8"
+    stroke-linecap="round" stroke-linejoin="round"
+    filter="url(#glow)"/>
+
+  <!-- area fill under line -->
+  <polygon points="90,320 155,290 200,310 255,230 300,250 355,175 420,140 420,370 90,370"
+    fill="url(#line)" opacity="0.08"/>
+
+  <!-- data nodes: 4 dimensions -->
+  <!-- technical: cyan -->
+  <circle cx="155" cy="290" r="10" fill="#00c8ff" filter="url(#glow)"/>
+  <circle cx="155" cy="290" r="6" fill="#0d1117"/>
+  <circle cx="155" cy="290" r="3" fill="#00c8ff"/>
+
+  <!-- sentiment: purple -->
+  <circle cx="255" cy="230" r="10" fill="#7857ff" filter="url(#glow)"/>
+  <circle cx="255" cy="230" r="6" fill="#0d1117"/>
+  <circle cx="255" cy="230" r="3" fill="#7857ff"/>
+
+  <!-- capital_flow: green -->
+  <circle cx="355" cy="175" r="10" fill="#00e5a0" filter="url(#glow)"/>
+  <circle cx="355" cy="175" r="6" fill="#0d1117"/>
+  <circle cx="355" cy="175" r="3" fill="#00e5a0"/>
+
+  <!-- fundamental: gold -->
+  <circle cx="300" cy="250" r="10" fill="#e8b84b" filter="url(#glow)"/>
+  <circle cx="300" cy="250" r="6" fill="#0d1117"/>
+  <circle cx="300" cy="250" r="3" fill="#e8b84b"/>
+
+  <!-- peak node: large -->
+  <circle cx="420" cy="140" r="14" fill="#00e5a0" filter="url(#glow)"/>
+  <circle cx="420" cy="140" r="8" fill="#0d1117"/>
+  <circle cx="420" cy="140" r="4" fill="#00e5a0"/>
+
+  <!-- "MM" text mark -->
+  <text x="256" y="430" text-anchor="middle"
+    font-family="IBM Plex Mono, monospace" font-weight="700" font-size="64"
+    fill="#e8b84b" opacity="0.9" letter-spacing="4">MM</text>
+
+  <!-- tagline -->
+  <text x="256" y="462" text-anchor="middle"
+    font-family="DM Sans, sans-serif" font-weight="400" font-size="18"
+    fill="#445566" letter-spacing="6">MORE MONEY</text>
+</svg>

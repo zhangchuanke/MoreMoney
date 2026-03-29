@@ -3,6 +3,7 @@
 职责：复盘本轮交易、评估决策质量、更新策略规则、触发自我进化
 """
 import json
+import logging
 from datetime import datetime
 from typing import Dict, List
 
@@ -11,8 +12,12 @@ from llm.prompts.reflection_prompts import REFLECTION_PROMPT, RULE_EXTRACTION_PR
 from core.state.agent_state import AgentState, AgentMemory
 from core.memory.long_term import LongTermMemory
 from core.memory.episodic import EpisodicMemory
+# ShortTermMemory 未在此 Agent 使用，不导入
 from self_evolution.performance_evaluator import PerformanceEvaluator
 from self_evolution.knowledge_updater import KnowledgeUpdater
+from compliance.rule_boundary import RuleBoundaryChecker
+
+logger = logging.getLogger("agents.reflection")
 
 
 class ReflectionAgent:
@@ -21,7 +26,7 @@ class ReflectionAgent:
     每轮结束后:
       1. 评估本轮决策质量（胜负、盈亏）
       2. 提取成功/失败模式
-      3. 更新 learned_rules（自我归纳的交易规则）
+      3. 更新 learned_rules（自我归纳的交易规则，经合规边界过滤）
       4. 判断是否需要策略大调整
       5. 更新迭代状态 → 决定下一轮继续还是终止
     """
@@ -32,6 +37,7 @@ class ReflectionAgent:
         self.episodic = EpisodicMemory()
         self.evaluator = PerformanceEvaluator()
         self.knowledge_updater = KnowledgeUpdater()
+        self.rule_boundary = RuleBoundaryChecker()
 
     async def reflect(self, state: AgentState) -> AgentState:
         executed_orders = state.get("executed_orders", [])
@@ -69,12 +75,17 @@ class ReflectionAgent:
 
         # 4. LLM 反思：提取规则、评估决策
         existing_rules = memory.get("learned_rules", [])
-        reflection_text = await self._llm_reflect(
-            state, perf, existing_rules
-        )
+        reflection_text = await self._llm_reflect(state, perf, existing_rules)
 
-        # 5. 提取新规则
-        new_rules = await self._extract_rules(reflection_text, existing_rules)
+        # 5. 提取新规则并通过合规边界过滤，拒绝任何含市场操纵/异常交易意图的规则
+        raw_rules = await self._extract_rules(reflection_text, existing_rules)
+        new_rules, rejected_rules = self.rule_boundary.filter_rules(raw_rules)
+        if rejected_rules:
+            logger.warning(
+                "[ReflectionAgent] %d 条规则因触及合规红线被拒绝写入: %s",
+                len(rejected_rules),
+                "; ".join(str(r) for r in rejected_rules),
+            )
         for rule in new_rules:
             self.long_term.save_rule(rule, source="reflection", confidence=0.6)
 
@@ -95,7 +106,7 @@ class ReflectionAgent:
         updated_memory: AgentMemory = {
             **memory,
             "recent_decisions": recent_decisions,
-            "learned_rules": (existing_rules + new_rules)[-50:],  # 保留最近50条
+            "learned_rules": (existing_rules + new_rules)[-50:],   # 保留最近50条（均已通过合规过滤）
             "market_regime": market_regime,
             "last_reflection": datetime.now().isoformat(),
         }
@@ -116,17 +127,26 @@ class ReflectionAgent:
             "strategy_update_needed": strategy_update_needed,
             "should_terminate": should_terminate,
             "logs": [
-                f"[ReflectionAgent] 反思完成，新规则 {len(new_rules)} 条，"
+                f"[ReflectionAgent] 反思完成，新规则 {len(new_rules)} 条"
+                f"（合规过滤拒绝 {len(rejected_rules)} 条），"
                 f"策略调整需要={strategy_update_needed}，终止={should_terminate}"
             ],
         }
 
     # ------------------------------------------------------------------
-    async def _llm_reflect(self, state: AgentState, perf: Dict, existing_rules: List[str]) -> str:
+    async def _llm_reflect(
+        self, state: AgentState, perf: Dict, existing_rules: List[str]
+    ) -> str:
         prompt = REFLECTION_PROMPT.format(
-            executed_orders=json.dumps(state.get("executed_orders", []), ensure_ascii=False, indent=2),
-            portfolio=json.dumps(state.get("portfolio", {}), ensure_ascii=False, indent=2),
-            signals=json.dumps(state.get("signals", [])[:10], ensure_ascii=False, indent=2),
+            executed_orders=json.dumps(
+                state.get("executed_orders", []), ensure_ascii=False, indent=2
+            ),
+            portfolio=json.dumps(
+                state.get("portfolio", {}), ensure_ascii=False, indent=2
+            ),
+            signals=json.dumps(
+                state.get("signals", [])[:10], ensure_ascii=False, indent=2
+            ),
             risk_flags=json.dumps(state.get("risk_flags", []), ensure_ascii=False),
             perf=json.dumps(perf, ensure_ascii=False, indent=2),
             existing_rules="\n".join(existing_rules) if existing_rules else "暂无",
@@ -134,7 +154,9 @@ class ReflectionAgent:
         )
         return await self.llm.chat(prompt)
 
-    async def _extract_rules(self, reflection_text: str, existing_rules: List[str]) -> List[str]:
+    async def _extract_rules(
+        self, reflection_text: str, existing_rules: List[str]
+    ) -> List[str]:
         prompt = RULE_EXTRACTION_PROMPT.format(
             reflection=reflection_text,
             existing_rules="\n".join(existing_rules) if existing_rules else "暂无",
